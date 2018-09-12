@@ -15,16 +15,18 @@ import (
 	"net/http"
 	"os"
 	"strconv"
+	"time"
 )
 
 // Type config represents the configuration for the application, with the names
 // of the variables representing their corresponding environment variables.
 type config struct {
-	URL       string
-	Username  string
-	Password  string
-	IgnoreSSL bool
-	Port      int
+	URL             string
+	Username        string
+	Password        string
+	IgnoreSSL       bool
+	Port            int
+	KeepalivePeriod int
 }
 
 // Package level configuration and http client
@@ -81,6 +83,18 @@ func init() {
 		conf.Port = 8000
 	}
 
+	// Parse the keepalive period
+	if keepalivePeriod, err := os.LookupEnv("SNAPSHOT_KEEPALIVE_PERIOD"); err {
+		var parseErr error
+		conf.KeepalivePeriod, parseErr = strconv.Atoi(keepalivePeriod)
+
+		if parseErr != nil {
+			log.Fatal("Invalid value for SNAPSHOT_KEEPALIVE_PERIOD")
+		}
+	} else {
+		conf.KeepalivePeriod = 10
+	}
+
 	// Set the ignore SSL setting in the HTTP client
 	http.DefaultTransport.(*http.Transport).TLSClientConfig = &tls.Config{
 		InsecureSkipVerify: conf.IgnoreSSL,
@@ -91,16 +105,37 @@ func main() {
 	// Login to the camera
 	sessionCookie, err := login()
 	if err != nil {
-		log.Fatalf("Login failed: %s", err)
+		log.Fatalf("Login - Login failed: %s", err)
 	}
+
+	// Boolean for if there has been recent access to snapshots.
+	recentActivity := false
+
+	// Keepalive routine, runs every period and makes an empty request to the
+	// snapshot route. This is because the session expires on the aircam if
+	// inactive for 15 minutes.
+	keepalive := time.NewTicker(time.Minute * time.Duration(conf.KeepalivePeriod))
+	go func() {
+		for range keepalive.C {
+			// Run an empty getImage if no recent activity, otherwise reset flag.
+			if !recentActivity {
+				log.Print("Alive - Running keepalive")
+				getImage(nil, sessionCookie, false)
+			} else {
+				recentActivity = false
+			}
+		}
+	}()
 
 	// Create handler function for retrieving images
 	handler := func(w http.ResponseWriter, r *http.Request) {
-		log.Print("Getting image")
+		log.Print("Image - Getting image")
 
 		// Set the header to indicate image content and retrieve image from AirCam
 		w.Header().Set("Content-Type", "image/jpeg")
-		getImage(w, sessionCookie)
+		getImage(w, sessionCookie, true)
+
+		recentActivity = true
 	}
 
 	// Associate handler
@@ -112,7 +147,7 @@ func main() {
 
 // getImage retrieves an image from a provided url using a session cookie.
 // It returns a byte slice with the image contents.
-func getImage(out io.Writer, sessionCookie *http.Cookie) {
+func getImage(out io.Writer, sessionCookie *http.Cookie, write bool) {
 	// Byte slice that will eventually hold the image contents
 	var image []byte
 
@@ -147,7 +182,9 @@ func getImage(out io.Writer, sessionCookie *http.Cookie) {
 	}
 
 	// Return the byte slice.
-	out.Write(image)
+	if write {
+		out.Write(image)
+	}
 }
 
 // login performs the login process for an AirCam.
